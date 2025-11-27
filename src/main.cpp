@@ -5,125 +5,168 @@
 #include <Update.h>
 #include <ArduinoJson.h>
 
-// ==== CONFIGURACIÓN DE RED ====
-const char* WIFI_SSID = "S20fe";
-const char* WIFI_PASS = "12345678";
+#include "secrets.h"   
 
-// ==== CONFIGURACIÓN MQTT ====
-const char* MQTT_SERVER = "esp32univalle.duckdns.org";
-const int   MQTT_PORT   = 8883;      // 8883 con TLS, 1883 sin TLS
-const char* MQTT_USER   = "alvaro";
-const char* MQTT_PASS   = "supersecreto";
-const char* MQTT_TOPIC  = "test/topic";
+// ============================
+// Variables globales
+// ============================
 
-// ==== CLIENTES ====
-// Cliente seguro SOLO para MQTT
+String currentVersion = "v0.0.1";   // La versión del firmware que tienes ahora
+
 WiFiClientSecure mqttSecureClient;
 PubSubClient mqttClient(mqttSecureClient);
 
-// Cliente HTTP independiente para OTA
-WiFiClientSecure httpsClient;
-
-// ==== VARIABLES ====
-String currentVersion = "v0.0.1";
-
-
 // ============================
-// ==== FUNCIÓN OTA HTTPS ====
+// ===== FUNCIÓN OTA HTTPS ====
 // ============================
-bool performOTA(String url) {
-  Serial.println("Iniciando descarga OTA desde: " + url);
+
+bool performOTA(const String& url) {
+  Serial.println("\n====================================");
+  Serial.println("        INICIANDO OTA DESDE S3      ");
+  Serial.println("====================================");
+  Serial.println("URL:");
+  Serial.println(url);
+  Serial.println("====================================");
+
+  if (!url.startsWith("https://")) {
+    Serial.println("ERROR: La URL OTA no es HTTPS.");
+    return false;
+  }
+
+  WiFiClientSecure httpsClient;
+  httpsClient.setInsecure();  // Permitir certificados S3 sin verificar
 
   HTTPClient https;
 
-  httpsClient.setInsecure();     // Permitir OTA sin certificado
-  https.begin(httpsClient, url);
+  if (!https.begin(httpsClient, url)) {
+    Serial.println(" ERROR: No se pudo iniciar conexión HTTPS.");
+    return false;
+  }
 
   int httpCode = https.GET();
+  Serial.printf("Código HTTP recibido: %d\n", httpCode);
+
   if (httpCode != HTTP_CODE_OK) {
-    Serial.printf("Error HTTP: %d\n", httpCode);
+    Serial.println("ERROR: No se pudo descargar firmware desde S3.");
     https.end();
     return false;
   }
 
   int contentLength = https.getSize();
+  if (contentLength <= 0) {
+    Serial.println(" ERROR: Tamaño de firmware inválido.");
+    https.end();
+    return false;
+  }
+
   WiFiClient * stream = https.getStreamPtr();
+  Serial.printf("Tamaño del firmware: %d bytes\n", contentLength);
 
   if (!Update.begin(contentLength)) {
+    Serial.println(" ERROR al preparar OTA:");
     Update.printError(Serial);
+    https.end();
     return false;
   }
 
   Serial.println("⬇ Escribiendo firmware...");
+
   size_t written = Update.writeStream(*stream);
 
   if (written != contentLength) {
-    Serial.printf("ERROR: Escribió %d de %d bytes\n", written, contentLength);
+    Serial.printf(" ERROR: escritos %d bytes de %d\n", written, contentLength);
+    https.end();
+    return false;
   }
 
-  if (Update.end()) {
-    if (Update.isFinished()) {
-      Serial.println("OTA completada. Reiniciando...");
-      delay(1000);
-      ESP.restart();
-    }
-  } else {
+  if (!Update.end()) {
+    Serial.println(" ERROR finalizando OTA:");
     Update.printError(Serial);
+    https.end();
+    return false;
   }
 
-  https.end();
+  if (!Update.isFinished()) {
+    Serial.println(" ERROR: OTA no completada.");
+    https.end();
+    return false;
+  }
+
+  Serial.println("====================================");
+  Serial.println("       OTA COMPLETADA EXITOSAMENTE");
+  Serial.println("       Reiniciando ESP32...");
+  Serial.println("====================================");
+
+  delay(1500);
+  ESP.restart();
   return true;
 }
 
 
 // ============================
-// ========== CALLBACK =========
+// ===== CALLBACK MQTT ========
 // ============================
+
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
-  Serial.println("Mensaje MQTT recibido");
+  Serial.println("\n=== MQTT Mensaje recibido ===");
+  Serial.print("Topic: ");
+  Serial.println(topic);
 
   String msg;
   for (unsigned int i = 0; i < length; i++) msg += (char)payload[i];
 
-  Serial.println("Payload: " + msg);
+  Serial.println("Payload:");
+  Serial.println(msg);
 
-  DynamicJsonDocument doc(512);
-  if (deserializeJson(doc, msg)) {
-    Serial.println("Error parseando JSON");
+  DynamicJsonDocument doc(2048);
+  auto error = deserializeJson(doc, msg);
+
+  if (error) {
+    Serial.print(" Error parseando JSON: ");
+    Serial.println(error.f_str());
     return;
   }
 
-  String newVersion = doc["version"];
-  String url        = doc["url"];
+  if (!doc.containsKey("version") || !doc.containsKey("url")) {
+    Serial.println(" JSON inválido. Falta 'version' o 'url'");
+    return;
+  }
+
+  String newVersion = doc["version"].as<String>();
+  String url        = doc["url"].as<String>();
+
+  Serial.printf("Versión actual: %s\n", currentVersion.c_str());
+  Serial.printf("Nueva versión: %s\n", newVersion.c_str());
 
   if (newVersion == currentVersion) {
-    Serial.println("Ya tengo la versión más reciente.");
+    Serial.println(" Ya tengo la versión más reciente.");
     return;
   }
 
-  Serial.printf("Nueva versión %s disponible (actual %s)\n",
-                newVersion.c_str(), currentVersion.c_str());
-
+  Serial.println(" NUEVA VERSIÓN DETECTADA — INICIANDO OTA");
   performOTA(url);
 }
 
 
+
 // ============================
-// ====== CONEXIÓN MQTT =======
+// ===== RECONNECT MQTT =======
 // ============================
+
 void reconnectMQTT() {
   while (!mqttClient.connected()) {
     Serial.print("Conectando a MQTT... ");
 
-    if (MQTT_USER && strlen(MQTT_USER) > 0)
+    if (strlen(MQTT_USER) > 0)
       mqttClient.connect("esp32-s3", MQTT_USER, MQTT_PASS);
     else
       mqttClient.connect("esp32-s3");
 
     if (mqttClient.connected()) {
-      Serial.println("Conectado");
-      mqttClient.subscribe(MQTT_TOPIC);
-      Serial.println("Suscrito a: " + String(MQTT_TOPIC));
+      Serial.println(" Conectado a MQTT.");
+      mqttClient.subscribe(MQTT_TOPIC_IN);
+      Serial.print(" Suscrito al topic: ");
+      Serial.println(MQTT_TOPIC_IN);
     } else {
       Serial.print("Error MQTT: ");
       Serial.println(mqttClient.state());
@@ -136,24 +179,28 @@ void reconnectMQTT() {
 // ============================
 // ========= SETUP ============
 // ============================
+
 void setup() {
   Serial.begin(115200);
-  delay(500);
+  delay(300);
 
-  Serial.println("\n=== ESP32-S3 OTA por MQTT ===");
+  Serial.println("\n=== ESP32 OTA by MQTT + HTTPS (S3) ===");
 
-  // ---- WIFI ----
+  // Conexión WiFi
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   Serial.print("Conectando a WiFi");
+
   while (WiFi.status() != WL_CONNECTED) {
     Serial.print(".");
     delay(300);
   }
-  Serial.println("\nWiFi conectado!");
+
+  Serial.println("\n✔ WiFi conectado");
+  Serial.print("IP: ");
   Serial.println(WiFi.localIP());
 
-  // ---- MQTT ----
-  mqttSecureClient.setInsecure();   // Permitir MQTT sin certificado
+  // Configurar MQTT
+  mqttSecureClient.setInsecure();
   mqttClient.setServer(MQTT_SERVER, MQTT_PORT);
   mqttClient.setCallback(mqttCallback);
 }
@@ -162,6 +209,7 @@ void setup() {
 // ============================
 // ========== LOOP ============
 // ============================
+
 void loop() {
   if (!mqttClient.connected()) reconnectMQTT();
   mqttClient.loop();
